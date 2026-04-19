@@ -56,12 +56,107 @@ For each move:
 
 1. `MCTS(game, net)` starts a tree from the current board.
 2. `search(num_simulations)` runs repeated simulations.
-3. `_select_child()` chooses promising child nodes using the PUCT formula.
+3. During each simulation, `_select_child()` chooses the next child using the PUCT formula.
 4. `_expand_and_evaluate()` calls the neural network on the leaf state.
 5. The returned policy is masked to legal moves only.
 6. Child nodes are created with those prior probabilities.
 7. `_backup()` updates visit counts and values.
-8. `select_action()` converts visit counts into the final chosen move.
+8. After all simulations finish, the root children's visit counts are normalized into `pi`.
+9. `select_action()` chooses the final move from that visit-count distribution.
+
+Important clarification:
+
+- PUCT is used while the search is still running.
+- Visit count is used after the search is finished.
+
+These are not conflicting rules; they serve different purposes.
+
+- `Q` in PUCT helps each simulation decide which branch currently looks strongest.
+- The exploration bonus `U` makes sure the search still tests moves that have high prior probability or low visit count.
+- Root visit count answers a different question: after many simulations, which move received the most search support?
+
+Why the final move is based on visit count instead of raw `Q`:
+
+- a move can have a high `Q` after only a few visits, which may be noisy
+- a high visit count means the move continued to look competitive across many simulations
+- AlphaZero-style training uses that root visit distribution as an improved policy target for the network
+
+So the flow is:
+
+1. inside each simulation: select by PUCT
+2. after all simulations: choose from root visit counts
+
+### MCTS Tree Structure In This Code
+
+Each `MCTSNode` stores search statistics, not a full board tensor.
+
+- `N`: visit count
+- `W`: total accumulated value
+- `Q`: mean value, computed as `W / N`
+- `P`: policy prior from the neural network
+- `children`: a dictionary mapping `action -> MCTSNode`
+- `terminal`: whether the node is terminal
+
+Important implementation detail:
+
+- the board state is not stored directly inside each node
+- during `search()`, the code copies the current `game` object and reconstructs positions by applying selected moves
+- so `self.root.children.items()` means "iterate through each legal root action and its child node"
+
+Example:
+
+- if `self.root.children = {0: child0, 3: child3, 5: child5}`
+- then `self.root.children.items()` iterates as `(0, child0)`, `(3, child3)`, `(5, child5)`
+
+### How Policy Prior Affects PUCT
+
+The search score is:
+
+`PUCT = Q + U`
+
+where:
+
+`U = C_PUCT * P * sqrt(total_visits) / (1 + N)`
+
+In this formula:
+
+- `Q` is what the search has learned so far about the move
+- `P` is the policy prior predicted by the neural network
+- `U` is the exploration bonus
+
+This means:
+
+- a higher prior `P` increases `U`
+- a move with higher `P` is explored more aggressively early in search
+- as a child's visit count `N` grows, `U` shrinks for that child
+- over time, the search relies less on the prior alone and more on the learned `Q`
+
+So the policy prior does not directly choose the move.
+It biases the search toward moves the network believes are promising.
+
+### Neural Network Output At Expansion
+
+When an unexpanded leaf is reached:
+
+1. the current board is converted to canonical form
+2. the neural network returns:
+   - a policy distribution over moves
+   - a scalar value for the position
+3. the policy is masked to legal moves and renormalized
+4. each legal move becomes a child node whose `P` is set from that masked policy
+
+This is why the numbers in an MCTS tree diagram should usually be interpreted as:
+
+- edge or child prior probabilities from the network
+- not final action probabilities
+
+The final action probabilities come later from normalized root visit counts.
+
+### One Note About This Implementation
+
+This code follows the general AlphaZero-style idea, but the current `_backup()` updates only the final node reached in the simulation.
+
+In a standard full MCTS implementation, value is usually backed up along the entire path from the expanded leaf to the root so that every node on that path updates its `N`, `W`, and `Q`.
 
 Training-time behavior:
 
